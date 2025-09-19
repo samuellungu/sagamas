@@ -1,131 +1,206 @@
-mtype = { START_TRANSACTION, SUBTRANSACTION_EXEC, SUCCESS, FAILURE, COMPENSATE, COMP_DONE };
+#ifndef N
+#define N 3
+#endif
 
-#define N 4          /* set to any number >= 1 */
-#define TR 1
+mtype = { START_TRANSACTION, SUBTRANSACTION_EXEC, SUCCESS, FAILURE,
+          COMPENSATE, COMP_DONE, DONE, DONE_ACK };
 
-/* Conflict predicate; customize as needed */
-#define CONFLICT(i,j) (0)
+/* channels */
+chan c_to[N]   = [2] of { mtype, byte };
+chan c_from[N] = [2] of { mtype, byte };
 
-chan c_to[N]   = [4] of { mtype, byte };
-chan c_from[N] = [4] of { mtype, byte };
+/* ---- Global propositions & bookkeeping ---- */
+bool reached_progress = false;   /* set at progress point */
+bool g_completed      = false;   /* set true on commit path */
+bool g_aborted        = false;   /* set true on failure/compensation path */
 
-/* bookkeeping / atomic props */
-byte pending   = 0;
-byte completed = 0;
-byte aborted   = 0;
+bool dispatched[N];              /* Coordinator sent SUBTRANSACTION_EXEC to i */
+bool answered[N];                /* Coordinator received SUCCESS/FAILURE from i */
+bool succeeded[N];               /* Coordinator received SUCCESS from i */
+bool compensated[N];             /* Coordinator observed COMP_DONE for i during abort */
+bool shutdown_seen[N];           /* Participant i observed DONE */
+byte shutdown_count = 0;         /* count of participants that saw DONE */
 
-/* execution state and compensation acks */
-byte executing[N];
-byte comp_ack[N];
-
-/*** PARTICIPANT ***/
-proctype Participant(byte id) {
+/* ------------- Participant ------------- */
+proctype Participant(byte id)
+{
     byte tr;
+end_wait:
     do
     :: c_to[id]?SUBTRANSACTION_EXEC, tr ->
-        /* nondet outcome */
         if
         :: c_from[id]!SUCCESS, tr
         :: c_from[id]!FAILURE, tr
         fi
     :: c_to[id]?COMPENSATE, tr ->
         c_from[id]!COMP_DONE, tr
+    :: c_to[id]?DONE, tr ->
+        if
+        :: !shutdown_seen[id] ->
+            shutdown_seen[id] = true;
+            shutdown_count++
+        :: else -> skip
+        fi;
+        /* Send ACK and terminate */
+        c_from[id]!DONE_ACK, tr;
+        break
     od
 }
 
-/*** COORDINATOR ***/
-proctype Coordinator() {
-    byte tr = TR;
-    byte i;
-    byte j;
-    byte dispatched = 0;
-    byte got = 0;
-    byte comp = 0;
+/* ------------- Coordinator ------------- */
+proctype Coordinator()
+{
+    byte i = 0;
+    byte tr = 1;
+    bool aborted = false;  /* local; mirrored by g_aborted when set */
 
-    /* dispatch to all participants (respect conflicts if you set CONFLICT) */
+    /* Initialize bookkeeping (explicit zeroing) */
     i = 0;
     do
     :: i < N ->
-        /* check conflicts with anyone executing */
-        j = 0;
-        do
-        :: j < N ->
-            if
-            :: (executing[j] == 1 && CONFLICT(i,j)) -> break
-            :: else -> j++
-            fi
-        :: else ->
-            c_to[i]!SUBTRANSACTION_EXEC, tr;
-            executing[i] = 1;
-            pending++;
-            dispatched++;
-            i++
-        od
+        dispatched[i] = false;
+        answered[i]   = false;
+        succeeded[i]  = false;
+        compensated[i]= false;
+        shutdown_seen[i] = false;
+        i++
     :: else -> break
     od;
+    i = 0;
 
-    /* collect outcomes from any ready participant */
+    /* sequential subtransactions; stop when aborted */
     do
-    :: got < dispatched ->
-        i = 0;
+    :: (i < N && !aborted) ->
+        dispatched[i] = true;
+        c_to[i]!SUBTRANSACTION_EXEC, tr;
         do
-        :: i < N ->
-            if
-            :: (len(c_from[i]) > 0) ->
-                if
-                :: c_from[i]?SUCCESS, tr -> pending--; executing[i]=0; got++
-                :: c_from[i]?FAILURE, tr -> aborted=1; executing[i]=0; got++
-                fi
-            fi;
-            i++
-        :: else -> break
+        :: c_from[i]?SUCCESS, tr ->
+            answered[i]  = true;
+            succeeded[i] = true;
+            i++; break
+        :: c_from[i]?FAILURE, tr ->
+            answered[i]  = true;
+            aborted      = true;
+            g_aborted    = true;
+            break
         od
     :: else -> break
     od;
 
     if
-    :: aborted == 0 ->
-        completed = 1
-    :: else ->
-        /* broadcast COMPENSATE to all */
-        i = 0;
+    :: aborted ->
+        /* compensate successful ones in reverse order */
         do
-        :: i < N -> c_to[i]!COMPENSATE, tr; i++
-        :: else -> break
-        od;
-
-        /* reset comp_ack */
-        i = 0;
-        do :: i < N -> comp_ack[i] = 0; i++ :: else -> break od;
-
-        /* wait for COMP_DONE from each participant (only once per i) */
-        do
-        :: comp < N ->
-            i = 0;
-            do
-            :: i < N ->
-                if
-                :: (comp_ack[i] == 0 && len(c_from[i]) > 0) ->
-                    if
-                    :: c_from[i]?COMP_DONE, tr -> comp_ack[i]=1; comp++
-                    fi
-                fi;
-                i++
-            :: else -> break
-            od
+        :: i > 0 ->
+            i--;
+            if
+            :: succeeded[i] ->
+                c_to[i]!COMPENSATE, tr;
+                c_from[i]?COMP_DONE, tr;
+                compensated[i] = true
+            :: else -> skip
+            fi
         :: else -> break
         od
-    fi
-}
+    :: else ->
+        g_completed = true
+    fi;
 
-/*** SYSTEM STARTUP ***/
-init {
+progress:
     atomic {
-        run Coordinator();
-        byte k = 0;
+        reached_progress = true;
+        /* broadcast DONE */
+        i = 0;
         do
-        :: k < N -> run Participant(k); k++
+        :: i < N -> c_to[i]!DONE, tr; i++
         :: else -> break
         od
     }
+
+    /* wait for DONE_ACK from all participants before exiting */
+    i = 0;
+    do
+    :: i < N ->
+        c_from[i]?DONE_ACK, tr;
+        i++
+    :: else -> break
+    od;
+
+    /* ---- Safety assertions at saga end ---- */
+    assert(g_completed || g_aborted);               /* must decide */
+    assert(!(g_completed && g_aborted));            /* not both */
+    /* Compensation implies prior success */
+    i = 0;
+    do
+    :: i < N ->
+        assert(!compensated[i] || succeeded[i]);
+        i++
+    :: else -> break
+    od;
+    /* If committed, then nobody should have been compensated */
+    if
+    :: g_completed ->
+        i = 0;
+        do
+        :: i < N -> assert(!compensated[i]); i++
+        :: else -> skip
+        od
+    :: else -> skip
+    fi;
+
+    /* Ensure all participants observed DONE */
+    assert(shutdown_count == N);
 }
+
+/* ------------- init ------------- */
+init {
+    byte i = 0;
+    printf("N=%d\\n", N);
+    atomic {
+        do
+        :: i < N -> run Participant(i); i++
+        :: else -> break
+        od;
+        run Coordinator();
+    }
+}
+
+/* ---------------- LTL PROPERTIES ---------------- */
+/* 1) Eventually reach progress (broadcast DONE) */
+ltl reach { <> reached_progress }
+
+/* 2) Eventually terminate (commit or abort reached) */
+ltl termination { <> (g_completed || g_aborted) }
+
+/* 3) Combined: eventually progress AND terminated */
+ltl both { <> (reached_progress && (g_completed || g_aborted)) }
+
+/* 4) Everyone eventually sees DONE */
+ltl all_done { <> (shutdown_count == N) }
+
+/* 5) Per-participant: if dispatched then eventually answered */
+#if N > 0
+ltl answered_0 { [] (dispatched[0] -> <> answered[0]) }
+#endif
+#if N > 1
+ltl answered_1 { [] (dispatched[1] -> <> answered[1]) }
+#endif
+#if N > 2
+ltl answered_2 { [] (dispatched[2] -> <> answered[2]) }
+#endif
+#if N > 3
+ltl answered_3 { [] (dispatched[3] -> <> answered[3]) }
+#endif
+#if N > 4
+ltl answered_4 { [] (dispatched[4] -> <> answered[4]) }
+#endif
+#if N > 5
+ltl answered_5 { [] (dispatched[5] -> <> answered[5]) }
+#endif
+#if N > 6
+ltl answered_6 { [] (dispatched[6] -> <> answered[6]) }
+#endif
+#if N > 7
+ltl answered_7 { [] (dispatched[7] -> <> answered[7]) }
+#endif
+
